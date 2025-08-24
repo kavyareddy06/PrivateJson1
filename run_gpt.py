@@ -9,4 +9,7 @@ if __name__ == "__main__":
     query = sys.argv[1]
     print("🚀 Running Agentic RAG pipeline...\n")
     result = agentic_rag_answer(query)
-    print("\n✅ Final Output:\n", result)
+
+    print(f"\n✅ Final Output Type: {result['type'].upper()}")
+    print("--------------------------------------------------")
+    print(result["answer"])

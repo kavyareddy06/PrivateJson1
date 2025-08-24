@@ -2,64 +2,91 @@
 import json
 import re
 from typing import Dict, Any, List
-from crewai.tools import tool
+from crewai_tools import tool
+from utils.llm_client import llm_complete
+from utils.json_index import (
+    detect_signals_from_context,
+    soft_intent_heuristics,
+)
 
-def _extract_candidate_keys(raw_text: str, limit: int = 32) -> List[str]:
-    # Catch JSONPath-like keys (`$.something[0].key`) and simple "key: value" lines
-    keys = set()
+SYSTEM_PROMPT = """You are a planning agent that understands a large Studio JSON schema.
+You receive:
+- user query
+- retrieved 'context' (raw text snippets and/or JSON path lines)
 
-    # JSONPath-ish
-    for m in re.finditer(r'(\$\.[\w\.\[\]]+)', raw_text):
-        keys.add(m.group(1))
+Your job:
+1) Infer the user's INTENT: one of ["LIST","EXPLAIN","GENERATE"].
+   - LIST: user wants lists (e.g., all commandNames, all styles, etc.)
+   - EXPLAIN: user wants explanations/definitions, behavior, usage, relationships.
+   - GENERATE: user wants you to produce or transform a JSON layout/snippet.
 
-    # key: value pairs
-    for line in raw_text.splitlines():
-        if ":" in line and len(line) < 160:
-            k = line.split(":", 1)[0].strip().strip('"').strip("'")
-            if k and len(k) < 60 and all(ch.isprintable() for ch in k):
-                keys.add(k)
+2) Identify TARGETS relevant to the query (e.g., ["commandName"], ["styles"], ["components"], ["layouts"], etc.).
+   Targets must be short, concrete nouns from the domain of Studio JSON.
 
-    return list(keys)[:limit]
+3) Extract CONSTRAINTS (filters, matchers, parts of the query like "only those used in layouts[2]", "starting with Transform", "responsive only").
+
+4) Decide EXPECTED_OUTPUT: "json" when you expect to produce a JSON output; otherwise "text".
+
+Return a strict JSON object with fields:
+{
+  "intent": "LIST" | "EXPLAIN" | "GENERATE",
+  "targets": string[],
+  "constraints": string[],
+  "expected_output": "json" | "text",
+  "notes": string
+}
+Do not include markdown. Return only valid JSON.
+"""
+
+def _llm_plan(query: str, context_preview: str) -> Dict[str, Any]:
+    user = f"QUERY:\n{query}\n\nCONTEXT (preview):\n{context_preview[:4000]}"
+    raw = llm_complete(system=SYSTEM_PROMPT, prompt=user, max_tokens=800)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
 
 @tool("planner_tool")
-def planner_tool(inputs: str) -> str:
+def planner_tool(inputs: Dict[str, Any]) -> str:
     """
     Planner Tool:
-    Input (stringified JSON): { "query": str, "context": str }
-    Always produces a JSON design spec for the developer, even if context is not pure JSON.
+    - Accepts {"query": str, "context": str}
+    - Uses heuristics + LLM to build a dynamic, executable plan for the developer tool.
+    - Returns a JSON string.
     """
-    try:
-        data = json.loads(inputs) if isinstance(inputs, str) else (inputs or {})
-    except Exception:
-        data = {}
+    query: str = (inputs or {}).get("query", "") or ""
+    context: str = (inputs or {}).get("context", "") or ""
 
-    query = data.get("query", "")
-    context = data.get("context", "")  # may be raw_text from retriever
+    # 1) quick heuristics on query + context to anchor the LLM
+    heuristic = soft_intent_heuristics(query)
+    detected = detect_signals_from_context(context)
 
-    candidate_keys = _extract_candidate_keys(context or "")
+    # 2) LLM planning pass (robust & dynamic)
+    llm_plan = _llm_plan(query, context)
 
-    design_spec: Dict[str, Any] = {
-        "type": "design_spec",
-        "query": query,
-        "assumptions": [
-            "Context may include JSONPath-like lines and text from PDFs.",
-            "We must generate a JSON layout and production-grade code from this.",
-        ],
-        "json_targets": {
-            "wants_json_layout": True,
-            "suggested_top_level": ["page", "sections", "styles", "responsive"],
-            "candidate_keys_from_context": candidate_keys,
+    # 3) Merge heuristics + LLM signal
+    intent = llm_plan.get("intent") or heuristic["intent"]
+    targets = llm_plan.get("targets") or heuristic["targets"] or detected["targets"]
+    expected_output = llm_plan.get("expected_output") or heuristic["expected_output"]
+    constraints = list(set((llm_plan.get("constraints") or []) + heuristic["constraints"]))
+
+    # 4) Hard fallback defaults
+    if intent not in {"LIST", "EXPLAIN", "GENERATE"}:
+        intent = heuristic["intent"]
+    if expected_output not in {"json", "text"}:
+        # LIST (JSON list), GENERATE (JSON), EXPLAIN (text)
+        expected_output = "json" if intent in {"LIST", "GENERATE"} else "text"
+
+    plan = {
+        "intent": intent,
+        "targets": targets or [],
+        "constraints": constraints,
+        "expected_output": expected_output,
+        "notes": llm_plan.get("notes", "auto-generated plan"),
+        # pass raw query/context forward too (developer may need it)
+        "_inputs": {
+            "query": query,
+            "context_preview": context[:2000],
         },
-        "ui_mapping_strategy": {
-            "header": "Use title/logo/navigation if present or requested.",
-            "body": "Map candidate keys into fields/components.",
-            "footer": "Static attribution or metadata.",
-        },
-        "deliverables": [
-            "A JSON layout object",
-            "End-to-end code file(s) (default: Streamlit app.py) that use the layout",
-            "Notes on how fields map from the KB"
-        ]
     }
-
-    return json.dumps(design_spec, indent=2, ensure_ascii=False)
+    return json.dumps(plan, indent=2)
